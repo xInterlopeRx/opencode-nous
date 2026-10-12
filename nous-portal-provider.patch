@@ -1,0 +1,551 @@
+From 4cad4fe078fde5f244ec2abb8895edc190166622 Mon Sep 17 00:00:00 2001
+From: xInterlopeRx <jkirk777@gmail.com>
+Date: Sun, 11 Oct 2026 20:57:19 -0500
+Subject: [PATCH] feat(core): add Nous Portal device-code OAuth provider
+
+Add Nous Research Portal sign-in (OAuth device-code flow) with token
+refresh and model discovery. Registers a "Nous Portal device code" auth
+method, polls the device-code grant, rotates the refresh token on
+refresh, and discovers v1/models from allowlisted inference hosts.
+
+Includes tests covering method registration, the connect-poll-refresh-
+discovery flow, rotated refresh tokens, hermes-model filtering, and
+rejection of non-allowlisted inference base URLs.
+---
+ packages/core/src/plugin/provider.ts          |   2 +
+ packages/core/src/plugin/provider/nous.ts     | 332 ++++++++++++++++++
+ .../core/test/plugin/provider-nous.test.ts    | 163 +++++++++
+ 3 files changed, 497 insertions(+)
+ create mode 100644 packages/core/src/plugin/provider/nous.ts
+ create mode 100644 packages/core/test/plugin/provider-nous.test.ts
+
+diff --git a/packages/core/src/plugin/provider.ts b/packages/core/src/plugin/provider.ts
+index d7b0654a6..b2f0562e8 100644
+--- a/packages/core/src/plugin/provider.ts
++++ b/packages/core/src/plugin/provider.ts
+@@ -17,6 +17,7 @@ import { LMStudioPlugin } from "./provider/lmstudio.js"
+ import { ModalPlugin } from "./provider/modal.js"
+ import { NeonPlugin } from "./provider/neon.js"
+ import { NvidiaPlugin } from "./provider/nvidia.js"
++import { NousPlugin } from "./provider/nous.js"
+ import { OllamaPlugin } from "./provider/ollama.js"
+ import { OpenAIPlugin } from "./provider/openai.js"
+ import { SnowflakeCortexPlugin } from "./provider/snowflake-cortex.js"
+@@ -51,6 +52,7 @@ export const ProviderPlugins: PluginInternal.InternalPlugin[] = [
+   ModalPlugin,
+   NeonPlugin,
+   NvidiaPlugin,
++  NousPlugin,
+   OllamaPlugin,
+   OpencodePlugin,
+   SnowflakeCortexPlugin,
+diff --git a/packages/core/src/plugin/provider/nous.ts b/packages/core/src/plugin/provider/nous.ts
+new file mode 100644
+index 000000000..de50fac01
+--- /dev/null
++++ b/packages/core/src/plugin/provider/nous.ts
+@@ -0,0 +1,332 @@
++import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
++import { define } from "@opencode/plugin/effect/plugin"
++import { Clock, Effect, Option, Schedule, Schema, Semaphore, Stream } from "effect"
++import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
++import { App } from "../../app.js"
++import { Bus } from "../../bus.js"
++import { Credential } from "../../credential.js"
++import { Integration } from "../../integration.js"
++import { IntegrationConnection } from "../../integration/connection.js"
++import { Model } from "../../model.js"
++import { Provider } from "../../provider.js"
++import type { PluginInternal } from "../internal.js"
++
++const providerID = Provider.ID.make("nous")
++const integrationID = Integration.ID.make("nous")
++const methodID = Integration.MethodID.make("device")
++const portalURL = "https://portal.nousresearch.com"
++const inferenceURL = "https://inference-api.nousresearch.com/v1"
++const clientID = "hermes-cli"
++const scope = "inference:invoke"
++const deviceGrant = "urn:ietf:params:oauth:grant-type:device_code"
++const Seconds = Schema.Union([Schema.Number, Schema.String])
++const Token = Schema.Struct({
++  access_token: Schema.String,
++  refresh_token: Schema.optional(Schema.String),
++  token_type: Schema.optional(Schema.String),
++  scope: Schema.optional(Schema.String),
++  expires_in: Schema.optional(Seconds),
++  inference_base_url: Schema.optional(Schema.String),
++})
++type Token = typeof Token.Type
++const Device = Schema.Struct({
++  device_code: Schema.String,
++  user_code: Schema.String,
++  verification_uri: Schema.String,
++  verification_uri_complete: Schema.optional(Schema.String),
++  expires_in: Seconds,
++  interval: Seconds,
++})
++const OAuthError = Schema.Struct({
++  error: Schema.optional(Schema.String),
++  error_description: Schema.optional(Schema.String),
++})
++const decodeOAuthError = Schema.decodeUnknownOption(Schema.fromJsonString(OAuthError))
++const RemoteModel = Schema.Struct({
++  id: Schema.String,
++  name: Schema.optional(Schema.String),
++})
++const Response = Schema.Struct({ data: Schema.Array(Schema.Unknown) })
++const decodeModel = Schema.decodeUnknownOption(RemoteModel)
++
++const oauth = (app: App.Info, http: HttpClient.HttpClient) =>
++  ({
++    integrationID,
++    method: {
++      id: methodID,
++      type: "oauth",
++      label: "Nous Portal device code",
++    },
++    authorize: () =>
++      sendForm(http, `${portalURL}/api/oauth/device/code`, { client_id: clientID, scope }, app).pipe(
++        Effect.flatMap((response) =>
++          response.status >= 200 && response.status < 300
++            ? HttpClientResponse.schemaBodyJson(Device)(response)
++            : failure(response, "Nous device authorization request failed"),
++        ),
++        Effect.flatMap((device) =>
++          Clock.currentTimeMillis.pipe(
++            Effect.map((created) => {
++              const lifetime = seconds(device.expires_in, 300)
++              return {
++                mode: "auto" as const,
++                url: device.verification_uri_complete ?? device.verification_uri,
++                instructions: `Open ${device.verification_uri} and enter code: ${device.user_code}`,
++                expiresAt: created + lifetime * 1000,
++                callback: poll(device, app, http).pipe(
++                  Effect.flatMap((tokens) => initialCredential(tokens, app, http)),
++                ),
++              }
++            }),
++          ),
++        ),
++      ),
++    refresh: (value) => refresh(value, app, http),
++  }) satisfies IntegrationOAuthMethodRegistration
++
++export const NousPlugin = define({
++  id: "opencode.provider.nous",
++  effect: Effect.fn(function* (ctx) {
++    const bus = yield* Bus.Service
++    const http = yield* HttpClient.HttpClient
++    const loading = Semaphore.makeUnsafe(1)
++    const loaded: {
++      models: readonly Model.Info[]
++      connection?: Effect.Success<ReturnType<typeof ctx.integration.connection.active>>
++    } = { models: [] }
++
++    const load = Effect.fn("NousPlugin.load")(function* () {
++      const connection = yield* ctx.integration.connection.active(integrationID)
++      const credential = connection
++        ? yield* ctx.integration.connection.resolve(connection).pipe(Effect.orElseSucceed(() => undefined))
++        : undefined
++      if (credential?.type !== "oauth" || credential.methodID !== methodID) {
++        loaded.models = []
++        loaded.connection = undefined
++        return
++      }
++
++      const sameConnection = IntegrationConnection.key(connection) === IntegrationConnection.key(loaded.connection)
++      if (!sameConnection) loaded.models = []
++
++      const remote = yield* http
++        .execute(
++          HttpClientRequest.get(`${inferenceBaseURL(credential.metadata?.inferenceBaseURL)}/models`).pipe(
++            HttpClientRequest.bearerToken(credential.access),
++            HttpClientRequest.acceptJson,
++          ),
++        )
++        .pipe(
++          Effect.filterOrFail((response) => response.status >= 200 && response.status < 300),
++          Effect.flatMap(HttpClientResponse.schemaBodyJson(Response)),
++          Effect.map((response) =>
++            response.data.flatMap((raw) => {
++              const model = Option.getOrUndefined(decodeModel(raw))
++              if (!model || model.id.toLowerCase().includes("hermes")) return []
++              const id = Model.ID.make(model.id)
++              return [
++                Model.Info.make({
++                  ...Model.Info.default(providerID, id),
++                  modelID: id,
++                  name: model.name ?? model.id,
++                  package: "@opencode/ai/providers/openai-compatible",
++                  settings: { baseURL: inferenceBaseURL(credential.metadata?.inferenceBaseURL), provider: providerID },
++                  capabilities: { tools: true, input: ["text"], output: ["text"] },
++                }),
++              ]
++            }),
++          ),
++          Effect.timeout("10 seconds"),
++          Effect.catch(() => Effect.succeed(undefined)),
++        )
++
++      if (
++        IntegrationConnection.key(connection) !==
++        IntegrationConnection.key(yield* ctx.integration.connection.active(integrationID))
++      )
++        return
++
++      loaded.connection = connection
++      if (remote) loaded.models = remote
++    })
++
++    yield* ctx.integration.transform((editor) => {
++      editor.update(integrationID, (integration) => (integration.name = "Nous Research"))
++      editor.method.update(oauth(ctx.app, http))
++    })
++    yield* ctx.provider.transform((editor) => {
++      editor.add({
++        info: {
++          id: providerID,
++          name: "Nous Research",
++          activation: "auto",
++          package: "@opencode/ai/providers/openai-compatible",
++          integrationID,
++          settings: { baseURL: inferenceURL, provider: providerID },
++        },
++        models: loaded.models,
++        ...(loaded.connection ? { sourceConnection: loaded.connection } : {}),
++      })
++    })
++
++    const refresh = () => loading.withPermit(load().pipe(Effect.andThen(ctx.provider.reload())))
++    yield* bus.subscribe(Credential.Event.Switched).pipe(
++      Stream.filter((event) => event.data.integrationID === integrationID),
++      Stream.runForEach(refresh),
++      Effect.forkScoped({ startImmediately: true }),
++    )
++    yield* refresh().pipe(Effect.repeat(Schedule.spaced("5 minutes")), Effect.forkScoped)
++  }),
++} satisfies PluginInternal.InternalPlugin)
++
++function poll(device: typeof Device.Type, app: App.Info, http: HttpClient.HttpClient): Effect.Effect<Token, unknown> {
++  return Effect.gen(function* () {
++    const expires = (yield* Clock.currentTimeMillis) + seconds(device.expires_in, 300) * 1000
++    const loop = (interval: number): Effect.Effect<Token, unknown> =>
++      Effect.gen(function* () {
++        if ((yield* Clock.currentTimeMillis) >= expires)
++          return yield* Effect.fail(new Error("Nous Portal device authorization timed out; please sign in again"))
++
++        const response = yield* sendForm(
++          http,
++          `${portalURL}/api/oauth/token`,
++          { grant_type: deviceGrant, client_id: clientID, device_code: device.device_code },
++          app,
++        )
++        if (response.status >= 200 && response.status < 300)
++          return yield* HttpClientResponse.schemaBodyJson(Token)(response)
++
++        const error = yield* readOAuthError(response)
++        if (error?.error === "authorization_pending")
++          return yield* Effect.sleep(interval).pipe(Effect.andThen(loop(interval)))
++        if (error?.error === "slow_down") {
++          const next = Math.min(interval + 1000, 30_000)
++          return yield* Effect.sleep(next).pipe(Effect.andThen(loop(next)))
++        }
++        return yield* Effect.fail(
++          new Error(
++            `Nous Portal device token exchange failed: ${error?.error_description ?? error?.error ?? response.status}`,
++          ),
++        )
++      })
++
++    return yield* loop(Math.max(1, Math.min(seconds(device.interval, 1), 1)) * 1000)
++  })
++}
++
++function initialCredential(tokens: Token, app: App.Info, http: HttpClient.HttpClient) {
++  if (!tokens.refresh_token) return Effect.fail(new Error("Nous Portal response did not include a refresh token"))
++  return refresh(
++    Credential.OAuth.make({
++      type: "oauth",
++      methodID,
++      refresh: tokens.refresh_token,
++      access: tokens.access_token,
++      expires: 0,
++      metadata: {
++        inferenceBaseURL: inferenceBaseURL(tokens.inference_base_url),
++        scope: tokens.scope ?? scope,
++      },
++    }),
++    app,
++    http,
++  )
++}
++
++function refresh(value: Credential.OAuth, app: App.Info, http: HttpClient.HttpClient) {
++  return sendForm(http, `${portalURL}/api/oauth/token`, { grant_type: "refresh_token", client_id: clientID }, app, {
++    "x-nous-refresh-token": value.refresh,
++  }).pipe(
++    Effect.flatMap((response) =>
++      response.status >= 200 && response.status < 300
++        ? HttpClientResponse.schemaBodyJson(Token)(response)
++        : failure(response, "Nous Portal token refresh failed"),
++    ),
++    Effect.flatMap((tokens) => {
++      const refreshed = Credential.OAuth.make({
++        type: "oauth",
++        methodID,
++        access: tokens.access_token,
++        refresh: tokens.refresh_token ?? value.refresh,
++        expires: tokenExpiration(tokens),
++        metadata: {
++          ...value.metadata,
++          inferenceBaseURL: inferenceBaseURL(tokens.inference_base_url),
++          scope: tokens.scope ?? value.metadata?.scope ?? scope,
++        },
++      })
++      return Effect.succeed(refreshed)
++    }),
++  )
++}
++
++function sendForm(
++  http: HttpClient.HttpClient,
++  url: string,
++  body: Readonly<Record<string, string>>,
++  app: App.Info,
++  headers: Readonly<Record<string, string>> = {},
++) {
++  return http.execute(
++    HttpClientRequest.post(url).pipe(
++      HttpClientRequest.acceptJson,
++      HttpClientRequest.setHeader("User-Agent", App.useragent(app)),
++      HttpClientRequest.setHeader("Content-Type", "application/x-www-form-urlencoded"),
++      HttpClientRequest.setHeaders(headers),
++      HttpClientRequest.bodyUrlParams(body),
++    ),
++  )
++}
++
++function failure(response: HttpClientResponse.HttpClientResponse, message: string) {
++  return readOAuthError(response).pipe(
++    Effect.flatMap((error) =>
++      Effect.fail(
++        new Error(`${message}${error?.error_description ? `: ${error.error_description}` : ` (${response.status})`}`),
++      ),
++    ),
++  )
++}
++
++function readOAuthError(response: HttpClientResponse.HttpClientResponse) {
++  return response.text.pipe(
++    Effect.map((body) => Option.getOrUndefined(decodeOAuthError(body))),
++    Effect.orElseSucceed(() => undefined),
++  )
++}
++
++function inferenceBaseURL(value: unknown) {
++  if (typeof value !== "string") return inferenceURL
++  const url = URL.parse(value)
++  if (
++    !url ||
++    url.protocol !== "https:" ||
++    url.port ||
++    url.username ||
++    url.password ||
++    url.search ||
++    url.hash ||
++    !["inference-api.nousresearch.com", "welcome-api.nousresearch.com"].includes(url.hostname)
++  )
++    return inferenceURL
++  return `${url.origin}${url.pathname}`.replace(/\/+$/, "")
++}
++
++function tokenExpiration(tokens: Token) {
++  const lifetime = seconds(tokens.expires_in, 0)
++  if (lifetime) return Math.trunc(Date.now() + lifetime * 1000)
++  const payload = tokens.access_token.split(".")[1]
++  if (payload) {
++    const claims = Schema.decodeUnknownOption(
++      Schema.fromJsonString(Schema.Struct({ exp: Schema.optional(Schema.Number) })),
++    )(Buffer.from(payload, "base64url").toString())
++    const expiration = Option.getOrUndefined(claims)?.exp
++    if (expiration) return Math.trunc(expiration * 1000)
++  }
++  return Date.now() + 60 * 60 * 1000
++}
++
++function seconds(value: number | string | undefined, fallback: number) {
++  const parsed = Number(value)
++  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback
++}
+diff --git a/packages/core/test/plugin/provider-nous.test.ts b/packages/core/test/plugin/provider-nous.test.ts
+new file mode 100644
+index 000000000..afc463d99
+--- /dev/null
++++ b/packages/core/test/plugin/provider-nous.test.ts
+@@ -0,0 +1,163 @@
++import { describe, expect } from "bun:test"
++import { Effect } from "effect"
++import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
++import { Credential } from "@opencode/core/credential"
++import { Integration } from "@opencode/core/integration"
++import { Model } from "@opencode/core/model"
++import { Plugin } from "@opencode/core/plugin"
++import { PluginHost } from "@opencode/core/plugin/host"
++import { NousPlugin } from "@opencode/core/plugin/provider/nous"
++import { ProviderPlugins } from "@opencode/core/plugin/provider"
++import { Provider } from "@opencode/core/provider"
++import { drain } from "../lib/clock"
++import { testEffect } from "../lib/effect"
++import { PluginTestLayer } from "./fixture"
++
++const it = testEffect(PluginTestLayer)
++const providerID = Provider.ID.make("nous")
++const integrationID = Integration.ID.make("nous")
++const methodID = Integration.MethodID.make("device")
++
++const addPlugin = Effect.fn(function* () {
++  const plugin = yield* Plugin.Service
++  const host = yield* PluginHost.make(plugin)
++  yield* NousPlugin.effect(host)
++})
++
++const discovery = Effect.gen(function* () {
++  const models = yield* Model.Service
++  const remote: {
++    requests: HttpClientRequest.HttpClientRequest[]
++    pending: boolean
++    inferenceBaseURL: string
++  } = {
++    requests: [],
++    pending: true,
++    inferenceBaseURL: "https://inference-api.nousresearch.com/v1",
++  }
++  const http = HttpClient.make((request) =>
++    Effect.sync(() => {
++      remote.requests.push(request)
++      if (request.url.endsWith("/api/oauth/device/code"))
++        return HttpClientResponse.fromWeb(
++          request,
++          Response.json({
++            device_code: "device-code",
++            user_code: "ABCD-1234",
++            verification_uri: "https://portal.nousresearch.com/device",
++            verification_uri_complete: "https://portal.nousresearch.com/device?code=ABCD-1234",
++            expires_in: 300,
++            interval: 1,
++          }),
++        )
++      if (request.url.endsWith("/api/oauth/token")) {
++        if (request.headers["x-nous-refresh-token"])
++          return HttpClientResponse.fromWeb(
++            request,
++            Response.json({
++              access_token: "inference-jwt",
++              refresh_token: "rotated-refresh-token",
++              token_type: "Bearer",
++              scope: "inference:invoke",
++              expires_in: 3600,
++              inference_base_url: remote.inferenceBaseURL,
++            }),
++          )
++        if (remote.pending) {
++          remote.pending = false
++          return HttpClientResponse.fromWeb(request, Response.json({ error: "authorization_pending" }, { status: 400 }))
++        }
++        return HttpClientResponse.fromWeb(
++          request,
++          Response.json({
++            access_token: "initial-token",
++            refresh_token: "initial-refresh-token",
++            expires_in: 3600,
++            scope: "inference:invoke",
++          }),
++        )
++      }
++      return HttpClientResponse.fromWeb(
++        request,
++        Response.json({ data: [{ id: "model-a", name: "Model A" }, { id: "hermes-4" }, { name: "invalid" }] }),
++      )
++    }),
++  )
++  return { models, remote, install: addPlugin().pipe(Effect.provideService(HttpClient.HttpClient, http)) }
++})
++
++describe("NousPlugin", () => {
++  it.effect("registers Portal device OAuth", () =>
++    Effect.gen(function* () {
++      const integrations = yield* Integration.Service
++      yield* addPlugin()
++
++      expect(ProviderPlugins.map((item) => item.id)).toContain("opencode.provider.nous")
++      expect((yield* integrations.get(integrationID))?.methods).toEqual([
++        { id: methodID, type: "oauth", label: "Nous Portal device code" },
++      ])
++    }),
++  )
++
++  it.effect("polls for device approval, refreshes rotated tokens, and discovers usable models", () =>
++    Effect.gen(function* () {
++      const fixture = yield* discovery
++      const integrations = yield* Integration.Service
++      const credentials = yield* Credential.Service
++      yield* fixture.install
++
++      const attempt = yield* integrations.oauth.connect({ integrationID, methodID })
++      expect(attempt.mode).toBe("auto")
++      expect(attempt.url).toBe("https://portal.nousresearch.com/device?code=ABCD-1234")
++      expect(attempt.instructions).toContain("ABCD-1234")
++      yield* drain
++
++      expect((yield* integrations.oauth.status({ integrationID, attemptID: attempt.attemptID })).status).toBe(
++        "complete",
++      )
++      expect(fixture.remote.requests.map((request) => request.url)).toEqual([
++        "https://portal.nousresearch.com/api/oauth/device/code",
++        "https://portal.nousresearch.com/api/oauth/token",
++        "https://portal.nousresearch.com/api/oauth/token",
++        "https://portal.nousresearch.com/api/oauth/token",
++        "https://inference-api.nousresearch.com/v1/models",
++      ])
++      expect(fixture.remote.requests[3]?.headers["x-nous-refresh-token"]).toBe("initial-refresh-token")
++      expect(fixture.remote.requests[4]?.headers.authorization).toBe("Bearer inference-jwt")
++
++      const saved = (yield* credentials.list(integrationID))[0]?.value
++      expect(saved).toMatchObject({
++        type: "oauth",
++        methodID,
++        access: "inference-jwt",
++        refresh: "rotated-refresh-token",
++        metadata: { inferenceBaseURL: "https://inference-api.nousresearch.com/v1" },
++      })
++      expect(yield* fixture.models.get(providerID, Model.ID.make("model-a"))).toMatchObject({
++        name: "Model A",
++        package: "@opencode/ai/providers/openai-compatible",
++        settings: { baseURL: "https://inference-api.nousresearch.com/v1" },
++      })
++      expect(yield* fixture.models.get(providerID, Model.ID.make("hermes-4"))).toBeUndefined()
++    }),
++  )
++
++  it.effect("rejects Portal-provided inference URLs outside the Nous host allowlist", () =>
++    Effect.gen(function* () {
++      const fixture = yield* discovery
++      const integrations = yield* Integration.Service
++      const credentials = yield* Credential.Service
++      yield* fixture.install
++      fixture.remote.inferenceBaseURL = "https://attacker.example/v1"
++      const attempt = yield* integrations.oauth.connect({ integrationID, methodID })
++      yield* drain
++      expect((yield* integrations.oauth.status({ integrationID, attemptID: attempt.attemptID })).status).toBe(
++        "complete",
++      )
++      const saved = (yield* credentials.list(integrationID))[0]?.value
++      expect(saved?.type === "oauth" && saved.metadata?.inferenceBaseURL).toBe(
++        "https://inference-api.nousresearch.com/v1",
++      )
++    }),
++  )
++})
+-- 
+2.53.0
+
